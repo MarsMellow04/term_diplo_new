@@ -4,7 +4,11 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-diplomacy = "0.2.0"
+arrayvec = {version= "0.7.8", features = ["serde"]}
+diplomacy =  {version = "0.2.0", features = ["serde"]}
 serde = { version = "1.0", features = ["derive"] }
 thiserror = "2.0.19"
-uuid = "1.24.0"
+uuid = {version ="1.24.0", features = ["v4", "serde"]}
+
+[dev-dependencies]
+serde_json = "1.0"

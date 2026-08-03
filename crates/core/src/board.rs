@@ -2,9 +2,10 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::todo;
-use diplomacy::geo::{Map, ProvinceKey, RegionKey};
+use diplomacy::geo::{self, Map, ProvinceKey, RegionKey};
 use diplomacy::judge::build::WorldState;
 use diplomacy::{Nation, UnitPosition, UnitType};
+use serde::{Deserialize, Serialize};
 
 use crate::phase::{OrderResult, RetreatSnapshot};
 use thiserror::Error;
@@ -21,6 +22,13 @@ pub struct Board {
     pub pending_retreat: Option<RetreatSnapshot>,
     pub board_history: Vec<HashMap<ProvinceKey, Nation>>
 }
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BoardSnapshot {
+    pub units: Vec<UnitPosition<'static, RegionKey>>,
+    pub ownership: HashMap<ProvinceKey, Nation>,
+    pub pending_retreat: Option<RetreatSnapshot>,
+    pub board_history: Vec<HashMap<ProvinceKey, Nation>>,
+}
 
 impl Board {
     pub fn update_new_positions(&mut self, given_positions: Vec<UnitPosition<'static, RegionKey>>) -> Result<(), BoardError> {
@@ -28,6 +36,34 @@ impl Board {
         // These are kept in the pending retreat until then and a check is done at the end to check all units are accounted for
         self.units = given_positions;
         Ok(())
+    }
+
+    pub fn units_for_nation(&self, nation: &Nation) -> HashSet<(UnitType, RegionKey)> {
+        // Copy of private function
+        self.units
+            .iter()
+            .filter(|u| u.nation() == nation)
+            .map(|u| (u.unit.unit_type(), u.as_region_ref().region.clone()))
+            .collect()
+    }
+
+    pub fn to_snapshot(&self) -> BoardSnapshot {
+        BoardSnapshot {
+            units: self.units.clone(),
+            ownership: self.ownership.clone(),
+            pending_retreat: self.pending_retreat.clone(),
+            board_history: self.board_history.clone(),
+        }
+    }
+
+    pub fn hydrate(snapshot: BoardSnapshot) -> Self {
+        Board {
+            map: Arc::new(geo::standard_map().clone()),
+            units: snapshot.units,
+            ownership: snapshot.ownership,
+            pending_retreat: snapshot.pending_retreat,
+            board_history: snapshot.board_history,
+        }
     }
 }
 

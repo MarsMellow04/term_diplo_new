@@ -9,6 +9,7 @@ use diplomacy::{
     judge::build::Submission as BldSubmission,
     order::{BuildCommand, ConvoyedMove, MainCommand, MoveCommand, Order as LibOrder, RetreatCommand, SupportedOrder},
 };
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::{board::Board, order::{Order, UnitType}};
@@ -30,7 +31,7 @@ pub enum Season {
     Winter,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize,)]
 pub enum GamePhase {
 /// Library Enum for the different rounds of a diplomacy game. 
 /// Can find the phase, or season to use with the polymorphic PhaseHandler.
@@ -84,7 +85,7 @@ impl GamePhase {
 
 // Resolution — owned, serializable, no lifetimes
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Resolution {
 /// Resolution has been made to stop the stupid Lifetime issues.
 /// The command should be able to immediatley parse the Order Result into a LibOrder when needed,
@@ -94,7 +95,7 @@ pub struct Resolution {
     /// Owned snapshot of dislodgement data from a main-phase adjudication
     pub retreat_snapshot: Option<RetreatSnapshot>,
 }
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RetreatSnapshot {
     dislodged: Vec<(LibOrder<RegionKey, MainCommand<RegionKey>>, LibOrder<RegionKey, MainCommand<RegionKey>>)>,
     retreat_destinations: Vec<(UnitPosition<'static, RegionKey>, Vec<(RegionKey, retreat::DestStatus)>)>,
@@ -170,7 +171,7 @@ impl RetreatSnapshot {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OrderResult {
     pub nation: Nation,
     pub unit_type: LibUnitType,
