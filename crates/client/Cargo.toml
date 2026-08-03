@@ -1,0 +1,6 @@
+[package]
+name = "diplo-client"
+edition = "2015"
+
+[dependencies]
+diplo-core = { path = "../core" }

@@ -1,0 +1,10 @@
+[package]
+name = "diplo-core"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+diplomacy = "0.2.0"
+serde = { version = "1.0", features = ["derive"] }
+thiserror = "2.0.19"
+uuid = "1.24.0"
