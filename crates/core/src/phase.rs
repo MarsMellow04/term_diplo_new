@@ -1,7 +1,12 @@
+use std::borrow::Cow;
+use std::collections::HashMap;
 use std::str::FromStr;
 
 use diplomacy::{
-    Nation, UnitType as LibUnitType, geo::RegionKey, judge::{OrderState, Rulebook, Submission}, order::{ConvoyedMove, MainCommand, MoveCommand, Order as LibOrder, SupportedOrder},
+    Nation, Unit, UnitPosition, UnitPositions, UnitType as LibUnitType,
+    geo::RegionKey,
+    judge::{OrderState, Rulebook, Submission, retreat},
+    order::{ConvoyedMove, MainCommand, MoveCommand, Order as LibOrder, RetreatCommand, SupportedOrder},
 };
 use thiserror::Error;
 
@@ -80,11 +85,102 @@ impl GamePhase {
 
 #[derive(Debug, Clone)]
 pub struct Resolution {
-/// Resolution has been made to stop the stupid Lifetime issues. 
-/// The command should be able to immediatley parse the Order Result into a LibOrder when needed, 
+/// Resolution has been made to stop the stupid Lifetime issues.
+/// The command should be able to immediatley parse the Order Result into a LibOrder when needed,
 /// TODO!: Move this order reuslt over and a way to convert them.
     pub has_dislodgements: bool,
     pub results: Vec<OrderResult>,
+    /// Owned snapshot of dislodgement data from a main-phase adjudication, set only by
+    /// `MainPhase::resolve`. `RetreatPhase::resolve` needs this to reconstruct a
+    /// `retreat::Start`, since that type can otherwise only be derived from a live
+    /// main-phase `Outcome` that doesn't survive past the call that produced it.
+    pub retreat_snapshot: Option<RetreatSnapshot>,
+}
+
+/// Owned, `'static` copy of everything `diplomacy::judge::retreat::Start` knows about a
+/// dislodgement, taken at the end of a main-phase adjudication. `Start<'a>` itself can't be
+/// stored here because its lifetime is tied to the main-phase `Outcome` (and, through that,
+/// to locals inside `MainPhase::resolve`) — it can't outlive that function call. This snapshot
+/// exists purely so `RetreatPhase::resolve` can rehydrate an equivalent `Start` later via
+/// `Start::from_raw_parts`.
+#[derive(Debug, Clone)]
+pub struct RetreatSnapshot {
+    /// (dislodged order, order that dislodged it) pairs.
+    dislodged: Vec<(LibOrder<RegionKey, MainCommand<RegionKey>>, LibOrder<RegionKey, MainCommand<RegionKey>>)>,
+    /// For each dislodged unit, its candidate retreat regions and their legality status.
+    retreat_destinations: Vec<(UnitPosition<'static, RegionKey>, Vec<(RegionKey, retreat::DestStatus)>)>,
+    /// Non-dislodged unit positions at the start of the retreat phase.
+    unit_positions: Vec<UnitPosition<'static, RegionKey>>,
+}
+
+/// Clone a borrowed unit position into a fully owned, `'static` one.
+fn owned_unit_position(pos: &UnitPosition<'_, &RegionKey>) -> UnitPosition<'static, RegionKey> {
+    UnitPosition::new(
+        Unit::new(Cow::Owned(pos.nation().clone()), pos.unit.unit_type()),
+        pos.region.clone(),
+    )
+}
+
+impl RetreatSnapshot {
+    fn from_start(start: &retreat::Start<'_>) -> Self {
+        let dislodged = start
+            .dislodged()
+            .iter()
+            .map(|(&dislodged_order, &dislodger)| (dislodged_order.clone(), dislodger.clone()))
+            .collect();
+
+        let retreat_destinations = start
+            .retreat_destinations()
+            .iter()
+            .map(|(pos, dests)| {
+                let owned_dests = dests
+                    .clone()
+                    .into_iter()
+                    .map(|(region, status)| (region.clone(), status))
+                    .collect();
+                (owned_unit_position(pos), owned_dests)
+            })
+            .collect();
+
+        let unit_positions = start.unit_positions().iter().map(owned_unit_position).collect();
+
+        Self {
+            dislodged,
+            retreat_destinations,
+            unit_positions,
+        }
+    }
+
+    pub fn dislodged_count(&self) -> usize {
+        self.dislodged.len()
+    }
+
+    fn to_start(&self) -> retreat::Start<'_> {
+        let dislodged: HashMap<_, _> = self
+            .dislodged
+            .iter()
+            .map(|(dislodged_order, dislodger)| (dislodged_order, dislodger))
+            .collect();
+
+        let retreat_destinations: HashMap<_, _> = self
+            .retreat_destinations
+            .iter()
+            .map(|(pos, dests)| {
+                let key = UnitPosition::new(pos.unit.clone(), &pos.region);
+                let dests: Vec<(&RegionKey, retreat::DestStatus)> =
+                    dests.iter().map(|(region, status)| (region, *status)).collect();
+                (key, dests)
+            })
+            .collect();
+
+        let unit_positions: Vec<_> = self
+            .unit_positions
+            .iter()
+            .map(|pos| UnitPosition::new(pos.unit.clone(), &pos.region))
+            .collect();
+
+        unsafe { retreat::Start::from_raw_parts(dislodged, retreat_destinations, unit_positions) }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -135,8 +231,9 @@ impl PhaseHandler for MainPhase {
         // Outcome borrows submission — extract everything before returning
         let outcome = submission.adjudicate(Rulebook::default());
 
-        // TODO! Figure out what to do when dislodged. 
-        let has_dislodgements = !outcome.to_retreat_start().dislodged().is_empty();
+        let start = outcome.to_retreat_start();
+        let snapshot = RetreatSnapshot::from_start(&start);
+        let has_dislodgements = snapshot.dislodged_count() > 0;
 
         let results = submission
             .submitted_orders()
@@ -156,9 +253,13 @@ impl PhaseHandler for MainPhase {
         // TODO: rebuild board.units from outcome after adjudication
         // board.units = extract_new_positions(&outcome);
 
+        // Give snapshot to the board, should be used by the board in the retreat phase next.
+        board.pending_retreat = Some(snapshot.clone());
+
         Resolution {
             has_dislodgements,
             results,
+            retreat_snapshot: Some(snapshot),
         }
     }
 }
@@ -170,8 +271,44 @@ impl PhaseHandler for MainPhase {
 pub struct RetreatPhase;
 
 impl PhaseHandler for RetreatPhase {
-    fn resolve(&self, _board: &mut Board, _orders: Vec<Order>) -> Resolution {
-        todo!("RetreatPhase::resolve not yet implemented")
+    fn resolve(&self, board: &mut Board, orders: Vec<Order>) -> Resolution {
+        let lib_orders: Vec<LibOrder<RegionKey, RetreatCommand<RegionKey>>> = orders
+            .iter()
+            .filter_map(to_retreat_order)
+            .collect();
+
+        // Rehydrate the snapshot to use during the retreat phase, 
+        let snapshot = board
+            .pending_retreat
+            .as_ref()
+            .expect("RetreatPhase::resolve called without a snapshot from a preceding MainPhase::resolve");
+
+        let start = snapshot.to_start();
+        let context = retreat::Context::new(&start, lib_orders);
+        let outcome = context.resolve();
+
+        let results = outcome
+            .order_outcomes()
+            .map(|(o, out)| {
+                let state: OrderState = out.into();
+                OrderResult {
+                    nation: o.nation.clone(),
+                    unit_type: o.unit_type.clone(),
+                    region: o.region.to_string(),
+                    command: format!("{}", o),
+                    succeeded: state == OrderState::Succeeds,
+                }
+            })
+            .collect();
+
+        // Retreats have been completed
+        board.pending_retreat = None;
+
+        Resolution {
+            has_dislodgements: false,
+            results,
+            retreat_snapshot: None,
+        }
     }
 }
 
@@ -248,6 +385,21 @@ fn to_main_order(order: &Order) -> Option<LibOrder<RegionKey, MainCommand<Region
             Some(LibOrder::new(nation, unit_type, region, MainCommand::Convoy(ConvoyedMove::new(army_location, target))))
         }
         _ => None,
+    }
+}
+
+fn to_retreat_order(order: &Order) -> Option<LibOrder<RegionKey, RetreatCommand<RegionKey>>> {
+    match order {
+        Order::Retreat { unit, target } => {
+                    let nation = to_nation(&unit.nation);
+                    let region = RegionKey::from_str(&unit.region).unwrap();
+                    let unit_type = map_unit_type(unit.unit_type); 
+                    let target = RegionKey::from_str(&target).unwrap();
+
+                    // TODO! There is also a retreat hold command I have no idea when that is used.
+                    Some(LibOrder::new(nation, unit_type, region, RetreatCommand::Move(target)))
+            }
+        _ => None
     }
 }
 // ---------------------------------------------------------------------------
@@ -460,6 +612,7 @@ mod tests {
             map: Arc::new(geo::standard_map().clone()),
             units: vec![unit_pos("ITA: A ven")],
             ownership: HashMap::new(),
+            pending_retreat: None,
         };
 
         let orders = vec![Order::Hold {
@@ -483,6 +636,7 @@ mod tests {
             map: Arc::new(geo::standard_map().clone()),
             units: vec![unit_pos("AUS: A tri")],
             ownership: HashMap::new(),
+            pending_retreat: None,
         };
 
         let orders = vec![Order::Move {
@@ -513,6 +667,7 @@ mod tests {
                 unit_pos("ITA: A ven"),
             ],
             ownership: HashMap::new(),
+            pending_retreat: None,
         };
 
         let orders = vec![
@@ -556,6 +711,7 @@ mod tests {
                 unit_pos("GER: A kie"),
             ],
             ownership: HashMap::new(),
+            pending_retreat: None,
         };
 
         let orders = vec![
@@ -585,5 +741,90 @@ mod tests {
             "head-to-head with equal strength should fail for both"
         );
         assert!(!resolution.has_dislodgements);
+    }
+    #[test]
+    fn retreat_phase_test() {
+        // GER attacks FRA's holding army in Kiel with support from Munich (strength 2 vs
+        // 1), dislodging it. Kiel borders ber, mun, den, hol, ruh; ber is excluded as the
+        // dislodger's origin and mun is excluded as still GER-occupied (it only supported,
+        // it didn't move), leaving den/hol/ruh as legal retreat destinations. FRA retreats
+        // to ruh, which nothing else in this turn touches.
+        let mut board = Board {
+            map: Arc::new(geo::standard_map().clone()),
+            units: vec![
+                unit_pos("GER: A ber"),
+                unit_pos("GER: A mun"),
+                unit_pos("FRA: A kie"),
+            ],
+            ownership: HashMap::new(),
+            pending_retreat: None,
+        };
+
+        let main_orders = vec![
+            Order::Move {
+                unit: UnitRef {
+                    nation: "ger".into(),
+                    unit_type: UnitType::Army,
+                    region: "ber".into(),
+                },
+                target: "kie".into(),
+            },
+            Order::Support {
+                unit: UnitRef {
+                    nation: "ger".into(),
+                    unit_type: UnitType::Army,
+                    region: "mun".into(),
+                },
+                supported: UnitRef {
+                    nation: "ger".into(),
+                    unit_type: UnitType::Army,
+                    region: "ber".into(),
+                },
+                target: "kie".into(),
+            },
+            Order::Hold {
+                unit: UnitRef {
+                    nation: "fra".into(),
+                    unit_type: UnitType::Army,
+                    region: "kie".into(),
+                },
+            },
+        ];
+
+        let main_resolution = MainPhase.resolve(&mut board, main_orders);
+
+        assert!(
+            main_resolution.has_dislodgements,
+            "a 2-strength supported attack should dislodge the 1-strength holder"
+        );
+        assert!(
+            board.pending_retreat.is_some(),
+            "MainPhase::resolve should stash a retreat snapshot on the board"
+        );
+
+        let retreat_orders = vec![Order::Retreat {
+            unit: UnitRef {
+                nation: "fra".into(),
+                unit_type: UnitType::Army,
+                region: "kie".into(),
+            },
+            target: "ruh".into(),
+        }];
+
+        let retreat_resolution = RetreatPhase.resolve(&mut board, retreat_orders);
+
+        assert_eq!(retreat_resolution.results.len(), 1);
+        assert!(
+            retreat_resolution.results[0].succeeded,
+            "retreating to an unblocked, non-dislodger-origin region should succeed"
+        );
+        assert!(
+            !retreat_resolution.has_dislodgements,
+            "retreats never cause further dislodgements"
+        );
+        assert!(
+            board.pending_retreat.is_none(),
+            "the snapshot should be consumed after RetreatPhase::resolve runs"
+        );
     }
 }

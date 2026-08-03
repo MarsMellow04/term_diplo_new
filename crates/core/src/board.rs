@@ -5,10 +5,13 @@ use diplomacy::geo::{Map, ProvinceKey, RegionKey};
 use diplomacy::judge::build::WorldState;
 use diplomacy::{Nation, UnitPosition, UnitType};
 
+use crate::phase::RetreatSnapshot;
+
 pub struct Board {
     pub map: Arc<Map>,
     pub units: Vec<UnitPosition<'static, RegionKey>>,
     pub ownership: HashMap<ProvinceKey, Nation>,
+    pub pending_retreat: Option<RetreatSnapshot>,
 }
 
 // For build-phase adjudication
