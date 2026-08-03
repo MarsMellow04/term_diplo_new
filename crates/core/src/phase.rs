@@ -1,12 +1,13 @@
-use std::borrow::Cow;
+use std::{borrow::Cow, todo};
 use std::collections::HashMap;
 use std::str::FromStr;
 
 use diplomacy::{
-    Nation, Unit, UnitPosition, UnitPositions, UnitType as LibUnitType,
-    geo::RegionKey,
-    judge::{OrderState, Rulebook, Submission, retreat},
-    order::{ConvoyedMove, MainCommand, MoveCommand, Order as LibOrder, RetreatCommand, SupportedOrder},
+    Nation, Unit, UnitPosition, UnitPositions, UnitType as LibUnitType, 
+    geo::RegionKey, 
+    judge::{OrderState, Rulebook, Submission, retreat}, 
+    judge::build::Submission as BldSubmission,
+    order::{BuildCommand, ConvoyedMove, MainCommand, MoveCommand, Order as LibOrder, RetreatCommand, SupportedOrder},
 };
 use thiserror::Error;
 
@@ -226,7 +227,7 @@ impl PhaseHandler for MainPhase {
             .filter_map(to_main_order)
             .collect();
 
-        let submission = Submission::new(&*board.map, &board.units, lib_orders);
+        let submission = Submission::new(&board.map, &board.units, lib_orders);
 
         // Outcome borrows submission — extract everything before returning
         let outcome = submission.adjudicate(Rulebook::default());
@@ -264,9 +265,7 @@ impl PhaseHandler for MainPhase {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Retreat Phase — stub
-// ---------------------------------------------------------------------------
+// Retreat Phase
 
 pub struct RetreatPhase;
 
@@ -312,15 +311,40 @@ impl PhaseHandler for RetreatPhase {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Build Phase — stub
-// ---------------------------------------------------------------------------
+// Build Phase 
 
 pub struct BuildPhase;
 
 impl PhaseHandler for BuildPhase {
-    fn resolve(&self, _board: &mut Board, _orders: Vec<Order>) -> Resolution {
-        todo!("BuildPhase::resolve not yet implemented")
+    fn resolve(&self, board: &mut Board, orders: Vec<Order>) -> Resolution {
+        let lib_orders: Vec<LibOrder<RegionKey, BuildCommand>> = orders
+            .iter()
+            .filter_map(to_build_order)
+            .collect();
+        let most_recent_history_stack = board.board_history.pop().expect("Should");
+        let submission  = BldSubmission::new(&board.map, &most_recent_history_stack, board, lib_orders);
+        let outcome = submission.adjudicate(Rulebook::default());
+
+        let results = outcome.order_outcomes()
+            .into_iter()
+            .map(|(ord, _out)| {
+                let state: OrderState = outcome.get(ord).unwrap().into();
+                OrderResult {
+                    nation: ord.nation.clone(),
+                    unit_type: ord.unit_type.clone(),
+                    region: ord.region.to_string(),
+                    command: format!("{}", ord),
+                    succeeded: state == OrderState::Succeeds,
+                }
+            })
+            .collect();
+
+        // let board extract new positions
+        Resolution {
+            has_dislodgements: false,
+            results,
+            retreat_snapshot: None,
+        }
     }
 }
 
@@ -391,14 +415,34 @@ fn to_main_order(order: &Order) -> Option<LibOrder<RegionKey, MainCommand<Region
 fn to_retreat_order(order: &Order) -> Option<LibOrder<RegionKey, RetreatCommand<RegionKey>>> {
     match order {
         Order::Retreat { unit, target } => {
-                    let nation = to_nation(&unit.nation);
-                    let region = RegionKey::from_str(&unit.region).unwrap();
-                    let unit_type = map_unit_type(unit.unit_type); 
-                    let target = RegionKey::from_str(&target).unwrap();
+                let nation = to_nation(&unit.nation);
+                let region = RegionKey::from_str(&unit.region).unwrap();
+                let unit_type = map_unit_type(unit.unit_type); 
+                let target = RegionKey::from_str(&target).unwrap();
 
-                    // TODO! There is also a retreat hold command I have no idea when that is used.
-                    Some(LibOrder::new(nation, unit_type, region, RetreatCommand::Move(target)))
+                // TODO! There is also a retreat hold command I have no idea when that is used.
+                Some(LibOrder::new(nation, unit_type, region, RetreatCommand::Move(target)))
             }
+        _ => None
+    }
+}
+
+fn to_build_order(order: &Order) -> Option<LibOrder<RegionKey, BuildCommand>> {
+    match order {
+        Order::Build { nation, territory, unit_type } => {
+            let nation = to_nation(nation);
+            let territory = RegionKey::from_str(territory).unwrap();
+            let unit_type = map_unit_type(*unit_type); 
+
+            Some(LibOrder::new(nation, unit_type, territory, BuildCommand::Build))
+        }
+        Order::Disband { unit } => {
+            let nation = to_nation(&unit.nation);
+            let unit_type = map_unit_type(unit.unit_type);
+            let region = RegionKey::from_str(&unit.region).unwrap();
+            Some(LibOrder::new(nation, unit_type, region, BuildCommand::Disband))
+        }
+
         _ => None
     }
 }
@@ -411,6 +455,7 @@ mod tests {
     use std::sync::Arc;
 
     use diplomacy::geo;
+    use diplomacy::judge::build;
     use diplomacy::UnitPosition;
 
     use super::*;
@@ -604,7 +649,201 @@ mod tests {
         }
     }
 
-    // Phase Handler Resolve tests
+    #[test]
+    fn main_phase_handler_generic_validate() {
+        let mut board = Board {
+            map: Arc::new(geo::standard_map().clone()),
+            units: vec![unit_pos("ITA: A ven")],
+            ownership: HashMap::new(),
+            pending_retreat: None,
+            board_history: vec![]
+        };
+
+        let orders = vec![Order::Hold {
+            unit: UnitRef {
+                nation: "ita".into(),
+                unit_type: UnitType::Army,
+                region: "ven".into(),
+            },
+        }];
+
+        let handler = handler_for(GamePhase::AutumnMain);
+        let is_valid = handler.validate(&orders[0], &board);
+
+        assert!(is_valid.is_ok(), "hold should succeed");
+
+        let resolution = handler.resolve(&mut board, orders);
+        assert_eq!(resolution.results.len(), 1, "one order should be resolved");
+
+        let next_phase = handler.next_phase(GamePhase::AutumnMain, &resolution);
+        assert_eq!(next_phase, GamePhase::WinterBuild, "should move onto next phase");
+    }
+
+    #[test]
+    fn retreat_phase_handler_generic_validate() {
+        // Chains handler_for(SpringMain) -> handler_for(SpringRetreat) -> handler_for(AutumnMain)
+        // to check the factory dispatches the right concrete handler at each step of a
+        // dislodgement/retreat pipeline, not just in isolation.
+        let mut board = Board {
+            map: Arc::new(geo::standard_map().clone()),
+            units: vec![
+                unit_pos("GER: A ber"),
+                unit_pos("GER: A mun"),
+                unit_pos("FRA: A kie"),
+            ],
+            ownership: HashMap::new(),
+            pending_retreat: None,
+            board_history: vec![],
+        };
+
+        let main_orders = vec![
+            Order::Move {
+                unit: UnitRef {
+                    nation: "ger".into(),
+                    unit_type: UnitType::Army,
+                    region: "ber".into(),
+                },
+                target: "kie".into(),
+            },
+            Order::Support {
+                unit: UnitRef {
+                    nation: "ger".into(),
+                    unit_type: UnitType::Army,
+                    region: "mun".into(),
+                },
+                supported: UnitRef {
+                    nation: "ger".into(),
+                    unit_type: UnitType::Army,
+                    region: "ber".into(),
+                },
+                target: "kie".into(),
+            },
+            Order::Hold {
+                unit: UnitRef {
+                    nation: "fra".into(),
+                    unit_type: UnitType::Army,
+                    region: "kie".into(),
+                },
+            },
+        ];
+
+        let main_handler = handler_for(GamePhase::SpringMain);
+        let main_resolution = main_handler.resolve(&mut board, main_orders);
+        assert!(
+            main_resolution.has_dislodgements,
+            "a 2-strength supported attack should dislodge the 1-strength holder"
+        );
+
+        let retreat_phase = main_handler.next_phase(GamePhase::SpringMain, &main_resolution);
+        assert_eq!(
+            retreat_phase,
+            GamePhase::SpringRetreat,
+            "a dislodgement should route to the retreat phase"
+        );
+
+        let retreat_orders = vec![Order::Retreat {
+            unit: UnitRef {
+                nation: "fra".into(),
+                unit_type: UnitType::Army,
+                region: "kie".into(),
+            },
+            target: "ruh".into(),
+        }];
+
+        let retreat_handler = handler_for(retreat_phase);
+        let is_valid = retreat_handler.validate(&retreat_orders[0], &board);
+        assert!(is_valid.is_ok(), "retreat order should validate");
+
+        let retreat_resolution = retreat_handler.resolve(&mut board, retreat_orders);
+        assert_eq!(retreat_resolution.results.len(), 1);
+        assert!(
+            retreat_resolution.results[0].succeeded,
+            "retreating to an unblocked, non-dislodger-origin region should succeed"
+        );
+
+        let next_main_phase = retreat_handler.next_phase(retreat_phase, &retreat_resolution);
+        assert_eq!(
+            next_main_phase,
+            GamePhase::AutumnMain,
+            "retreat phase should always advance to the next main phase"
+        );
+    }
+
+    #[test]
+    fn build_phase_handler_generic_validate() {
+        let mut board = Board {
+            map: Arc::new(geo::standard_map().clone()),
+            units: vec![unit_pos("AUS: A bud"), unit_pos("AUS: A tri")],
+            ownership: HashMap::new(),
+            pending_retreat: None,
+            board_history: vec![build::to_initial_ownerships(geo::standard_map())],
+        };
+
+        let orders = vec![Order::Build {
+            nation: "aus".into(),
+            territory: "vie".into(),
+            unit_type: UnitType::Army,
+        }];
+
+        let handler = handler_for(GamePhase::WinterBuild);
+        let is_valid = handler.validate(&orders[0], &board);
+        assert!(is_valid.is_ok(), "build order should validate");
+
+        let resolution = handler.resolve(&mut board, orders);
+        assert_eq!(resolution.results.len(), 1);
+        assert!(
+            resolution.results[0].succeeded,
+            "AUS should be entitled to build in its own unoccupied home supply center"
+        );
+
+        let next_phase = handler.next_phase(GamePhase::WinterBuild, &resolution);
+        assert_eq!(
+            next_phase,
+            GamePhase::SpringMain,
+            "build phase should always advance to spring main"
+        );
+    }
+
+    #[test]
+    fn handler_for_next_phase_branches() {
+        // Every GamePhase, crossed with both dislodgement outcomes, dispatched through
+        // handler_for(). Confirms the factory produces a working handler for each phase_kind
+        // and that PhaseHandler::next_phase's default delegation to GamePhase::next covers
+        // every branch (including the phases where the flag is a no-op).
+        let dislodged = Resolution {
+            has_dislodgements: true,
+            results: vec![],
+            retreat_snapshot: None,
+        };
+        let clear = Resolution {
+            has_dislodgements: false,
+            results: vec![],
+            retreat_snapshot: None,
+        };
+
+        let test_cases = [
+            (GamePhase::SpringMain, &dislodged, GamePhase::SpringRetreat),
+            (GamePhase::SpringMain, &clear, GamePhase::AutumnMain),
+            (GamePhase::SpringRetreat, &dislodged, GamePhase::AutumnMain),
+            (GamePhase::SpringRetreat, &clear, GamePhase::AutumnMain),
+            (GamePhase::AutumnMain, &dislodged, GamePhase::AutumnRetreat),
+            (GamePhase::AutumnMain, &clear, GamePhase::WinterBuild),
+            (GamePhase::AutumnRetreat, &dislodged, GamePhase::WinterBuild),
+            (GamePhase::AutumnRetreat, &clear, GamePhase::WinterBuild),
+            (GamePhase::WinterBuild, &dislodged, GamePhase::SpringMain),
+            (GamePhase::WinterBuild, &clear, GamePhase::SpringMain),
+        ];
+
+        for (phase, resolution, expected) in test_cases {
+            let handler = handler_for(phase);
+            assert_eq!(
+                handler.next_phase(phase, resolution),
+                expected,
+                "handler_for({phase:?}) next_phase mismatch for has_dislodgements={}",
+                resolution.has_dislodgements
+            );
+        }
+    }
 
     #[test]
     fn main_phase_hold_succeeds() {
@@ -613,6 +852,7 @@ mod tests {
             units: vec![unit_pos("ITA: A ven")],
             ownership: HashMap::new(),
             pending_retreat: None,
+            board_history: vec![]
         };
 
         let orders = vec![Order::Hold {
@@ -637,6 +877,7 @@ mod tests {
             units: vec![unit_pos("AUS: A tri")],
             ownership: HashMap::new(),
             pending_retreat: None,
+            board_history: vec![]
         };
 
         let orders = vec![Order::Move {
@@ -668,6 +909,7 @@ mod tests {
             ],
             ownership: HashMap::new(),
             pending_retreat: None,
+            board_history: vec![]
         };
 
         let orders = vec![
@@ -712,6 +954,7 @@ mod tests {
             ],
             ownership: HashMap::new(),
             pending_retreat: None,
+            board_history: vec![]
         };
 
         let orders = vec![
@@ -758,6 +1001,7 @@ mod tests {
             ],
             ownership: HashMap::new(),
             pending_retreat: None,
+            board_history: vec![]
         };
 
         let main_orders = vec![
@@ -825,6 +1069,154 @@ mod tests {
         assert!(
             board.pending_retreat.is_none(),
             "the snapshot should be consumed after RetreatPhase::resolve runs"
+        );
+    }
+
+    #[test]
+    fn build_phase_happy_path() {
+        // AUS owns all 3 of its home supply centers (bud, tri, vie) per the standard
+        // starting ownership map, but only has 2 units on the board, so it's entitled to
+        // exactly one build. `board_history` holds the "last_time" ownership snapshot
+        // BuildPhase::resolve needs (it pops the most recent one); using
+        // `to_initial_ownerships` mirrors the "first winter" case the crate docs describe.
+        let mut board = Board {
+            map: Arc::new(geo::standard_map().clone()),
+            units: vec![unit_pos("AUS: A bud"), unit_pos("AUS: A tri")],
+            ownership: HashMap::new(),
+            pending_retreat: None,
+            board_history: vec![build::to_initial_ownerships(geo::standard_map())],
+        };
+
+        let orders = vec![Order::Build {
+            nation: "aus".into(),
+            territory: "vie".into(),
+            unit_type: UnitType::Army,
+        }];
+
+        let resolution = BuildPhase.resolve(&mut board, orders);
+
+        assert_eq!(resolution.results.len(), 1);
+        assert!(
+            resolution.results[0].succeeded,
+            "AUS should be entitled to build in its own unoccupied home supply center"
+        );
+        assert!(!resolution.has_dislodgements, "builds never cause dislodgements");
+    }
+
+    #[test]
+    fn build_phase_rejects_foreign_controlled_home_center() {
+        // GER's unit is standing in Vienna, one of AUS's home supply centers (as if GER
+        // captured it in an earlier turn). AUS is still in Build mode overall (it owns
+        // bud + tri, giving it more SCs than its 1 unit), but a build order into vie must
+        // be rejected: vie is still statically an AUS home center, but GER controls it
+        // right now.
+        let mut board = Board {
+            map: Arc::new(geo::standard_map().clone()),
+            units: vec![unit_pos("AUS: A bud"), unit_pos("GER: A vie")],
+            ownership: HashMap::new(),
+            pending_retreat: None,
+            board_history: vec![build::to_initial_ownerships(geo::standard_map())],
+        };
+
+        let orders = vec![Order::Build {
+            nation: "aus".into(),
+            territory: "vie".into(),
+            unit_type: UnitType::Army,
+        }];
+
+        let resolution = BuildPhase.resolve(&mut board, orders);
+
+        assert_eq!(resolution.results.len(), 1);
+        assert!(
+            !resolution.results[0].succeeded,
+            "AUS can't build in vie while GER's unit currently controls it"
+        );
+    }
+
+    #[test]
+    fn build_phase_disband_succeeds_when_over_unit_cap() {
+        // AUS holds all 3 of its home centers (bud, tri, vie) but has a 4th unit sitting
+        // in boh (not a supply center), putting it one unit over what its 3 centers
+        // support -> Disband mode with an allowance of 1.
+        let mut board = Board {
+            map: Arc::new(geo::standard_map().clone()),
+            units: vec![
+                unit_pos("AUS: A bud"),
+                unit_pos("AUS: A tri"),
+                unit_pos("AUS: A vie"),
+                unit_pos("AUS: A boh"),
+            ],
+            ownership: HashMap::new(),
+            pending_retreat: None,
+            board_history: vec![build::to_initial_ownerships(geo::standard_map())],
+        };
+
+        let orders = vec![Order::Disband {
+            unit: UnitRef {
+                nation: "aus".into(),
+                unit_type: UnitType::Army,
+                region: "boh".into(),
+            },
+        }];
+
+        let resolution = BuildPhase.resolve(&mut board, orders);
+
+        assert_eq!(resolution.results.len(), 1);
+        assert!(
+            resolution.results[0].succeeded,
+            "AUS must disband down to its 3-center capacity, and boh is a legal target"
+        );
+    }
+
+    #[test]
+    fn build_phase_rejects_second_build_once_allowance_is_used() {
+        // ENG owns all 3 of its home centers (edi, lon, lvp) but has only 2 units, so
+        // it's entitled to exactly 1 build. Two build orders into the one empty center
+        // (Army, then Fleet, so they're distinguishable orders rather than duplicates)
+        // should succeed once and then fail with AllBuildsUsed.
+        let mut board = Board {
+            map: Arc::new(geo::standard_map().clone()),
+            units: vec![unit_pos("ENG: A lon"), unit_pos("ENG: F lvp")],
+            ownership: HashMap::new(),
+            pending_retreat: None,
+            board_history: vec![build::to_initial_ownerships(geo::standard_map())],
+        };
+
+        let orders = vec![
+            Order::Build {
+                nation: "eng".into(),
+                territory: "edi".into(),
+                unit_type: UnitType::Army,
+            },
+            Order::Build {
+                nation: "eng".into(),
+                territory: "edi".into(),
+                unit_type: UnitType::Fleet,
+            },
+        ];
+
+        let resolution = BuildPhase.resolve(&mut board, orders);
+
+        assert_eq!(resolution.results.len(), 2);
+
+        let army_result = resolution
+            .results
+            .iter()
+            .find(|r| r.unit_type == LibUnitType::Army)
+            .expect("army build order should be present");
+        let fleet_result = resolution
+            .results
+            .iter()
+            .find(|r| r.unit_type == LibUnitType::Fleet)
+            .expect("fleet build order should be present");
+
+        assert!(
+            army_result.succeeded,
+            "the first build should use up ENG's only allowance"
+        );
+        assert!(
+            !fleet_result.succeeded,
+            "the second build should fail once the allowance is already used"
         );
     }
 }

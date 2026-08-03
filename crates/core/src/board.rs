@@ -12,6 +12,7 @@ pub struct Board {
     pub units: Vec<UnitPosition<'static, RegionKey>>,
     pub ownership: HashMap<ProvinceKey, Nation>,
     pub pending_retreat: Option<RetreatSnapshot>,
+    pub board_history: Vec<HashMap<ProvinceKey, Nation>>
 }
 
 // For build-phase adjudication
@@ -21,7 +22,7 @@ impl WorldState for Board {
     }
 
     fn occupier(&self, province: &ProvinceKey) -> Option<&Nation> {
-        self.ownership.get(province)
+        self.units.iter().find(|u| u.region.province() == province).map(|u| u.nation())
     }
 
     fn unit_count(&self, nation: &Nation) -> u8 {
