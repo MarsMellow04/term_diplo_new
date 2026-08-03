@@ -27,7 +27,10 @@ pub enum UnitType {
 
 impl fmt::Display for UnitType {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "{:?}", self)
+        match self {
+            Self::Army => write!(f, "Army"),
+            Self::Fleet => write!(f, "Fleet"),
+        }
     }
 }
 
