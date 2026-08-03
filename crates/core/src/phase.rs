@@ -91,31 +91,17 @@ pub struct Resolution {
 /// TODO!: Move this order reuslt over and a way to convert them.
     pub has_dislodgements: bool,
     pub results: Vec<OrderResult>,
-    /// Owned snapshot of dislodgement data from a main-phase adjudication, set only by
-    /// `MainPhase::resolve`. `RetreatPhase::resolve` needs this to reconstruct a
-    /// `retreat::Start`, since that type can otherwise only be derived from a live
-    /// main-phase `Outcome` that doesn't survive past the call that produced it.
+    /// Owned snapshot of dislodgement data from a main-phase adjudication
     pub retreat_snapshot: Option<RetreatSnapshot>,
 }
-
-/// Owned, `'static` copy of everything `diplomacy::judge::retreat::Start` knows about a
-/// dislodgement, taken at the end of a main-phase adjudication. `Start<'a>` itself can't be
-/// stored here because its lifetime is tied to the main-phase `Outcome` (and, through that,
-/// to locals inside `MainPhase::resolve`) — it can't outlive that function call. This snapshot
-/// exists purely so `RetreatPhase::resolve` can rehydrate an equivalent `Start` later via
-/// `Start::from_raw_parts`.
 #[derive(Debug, Clone)]
 pub struct RetreatSnapshot {
-    /// (dislodged order, order that dislodged it) pairs.
     dislodged: Vec<(LibOrder<RegionKey, MainCommand<RegionKey>>, LibOrder<RegionKey, MainCommand<RegionKey>>)>,
-    /// For each dislodged unit, its candidate retreat regions and their legality status.
     retreat_destinations: Vec<(UnitPosition<'static, RegionKey>, Vec<(RegionKey, retreat::DestStatus)>)>,
-    /// Non-dislodged unit positions at the start of the retreat phase.
     unit_positions: Vec<UnitPosition<'static, RegionKey>>,
 }
 
-/// Clone a borrowed unit position into a fully owned, `'static` one.
-fn owned_unit_position(pos: &UnitPosition<'_, &RegionKey>) -> UnitPosition<'static, RegionKey> {
+pub (crate) fn owned_unit_position(pos: &UnitPosition<'_, &RegionKey>) -> UnitPosition<'static, RegionKey> {
     UnitPosition::new(
         Unit::new(Cow::Owned(pos.nation().clone()), pos.unit.unit_type()),
         pos.region.clone(),
@@ -251,11 +237,15 @@ impl PhaseHandler for MainPhase {
             })
             .collect();
 
-        // TODO: rebuild board.units from outcome after adjudication
-        // board.units = extract_new_positions(&outcome);
+        let new_positions: Vec<UnitPosition<'static, RegionKey>> = start
+            .unit_positions()
+            .iter()
+            .map(owned_unit_position)
+            .collect();
 
         // Give snapshot to the board, should be used by the board in the retreat phase next.
         board.pending_retreat = Some(snapshot.clone());
+        let _ = board.update_new_positions(new_positions);
 
         Resolution {
             has_dislodgements,
@@ -300,8 +290,15 @@ impl PhaseHandler for RetreatPhase {
             })
             .collect();
 
+        let new_positions: Vec<UnitPosition<'static, RegionKey>> = outcome
+            .unit_positions()
+            .iter()
+            .map(owned_unit_position)
+            .collect();
+
         // Retreats have been completed
         board.pending_retreat = None;
+        let _ = board.update_new_positions(new_positions);
 
         Resolution {
             has_dislodgements: false,
@@ -311,7 +308,7 @@ impl PhaseHandler for RetreatPhase {
     }
 }
 
-// Build Phase 
+// Build Phase
 
 pub struct BuildPhase;
 
@@ -339,7 +336,11 @@ impl PhaseHandler for BuildPhase {
             })
             .collect();
 
-        // let board extract new positions
+        let new_positions: Vec<UnitPosition<'static, RegionKey>> =
+            outcome.to_final_unit_positions().collect();
+
+        let _ = board.update_new_positions(new_positions);
+
         Resolution {
             has_dislodgements: false,
             results,
@@ -451,7 +452,8 @@ fn to_build_order(order: &Order) -> Option<LibOrder<RegionKey, BuildCommand>> {
 // ---------------------------------------------------------------------------
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::assert_ne;
+use std::collections::HashMap;
     use std::sync::Arc;
 
     use diplomacy::geo;
@@ -880,6 +882,8 @@ mod tests {
             board_history: vec![]
         };
 
+        let prev_units = board.units.clone();
+
         let orders = vec![Order::Move {
             unit: UnitRef {
                 nation: "aus".into(),
@@ -897,6 +901,8 @@ mod tests {
             "unopposed move into empty province should succeed"
         );
         assert!(!resolution.has_dislodgements);
+        // Should be different showing move
+        assert_ne!(board.units, prev_units);
     }
 
     #[test]
